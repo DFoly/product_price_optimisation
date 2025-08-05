@@ -1,0 +1,35 @@
+prd:
+  catalog_name: mlops_prd
+  schema_name: marvel_characters
+acc:
+  catalog_name: mlops_acc
+  schema_name: marvel_characters
+dev:
+  catalog_name: mlops_dev
+  schema_name: marvel_characters
+
+
+experiment_name_basic: /Shared/marvel-characters-basic
+experiment_name_custom: /Shared/marvel-characters-custom
+
+parameters:
+  learning_rate: 0.01
+  n_estimators: 1000
+  max_depth: 6
+
+
+num_features:
+  - Height
+  - Weight
+
+cat_features:
+  - Universe
+  - Identity
+  - Gender
+  - Marital_Status
+  - Teams
+  - Origin
+  - Magic
+  - Mutant
+
+target: Alive
