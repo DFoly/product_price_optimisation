@@ -1,0 +1,35 @@
+prd:
+  catalog_name: prod
+  schema_name: price_optimisation
+test:
+  catalog_name: test
+  schema_name: price_optimisation
+dev:
+  catalog_name: dev
+  schema_name: price_optimisation
+
+
+experiment_name_basic: /Shared/product-price-optimisation-basic
+experiment_name_custom: /Shared/product-price-optimisation-custom
+
+parameters:
+  learning_rate: 0.01
+  n_estimators: 1000
+  max_depth: 6
+
+
+num_features:
+  - Height
+  - Weight
+
+cat_features:
+  - Universe
+  - Identity
+  - Gender
+  - Marital_Status
+  - Teams
+  - Origin
+  - Magic
+  - Mutant
+
+target: Alive

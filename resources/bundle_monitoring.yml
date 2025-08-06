@@ -1,13 +1,13 @@
 resources:
   jobs:
-    marvel-characters-monitor-update:
-      name: marvel-characters-monitor-update-workflow
+    price-optimisation-monitor-update:
+      name: price-optimisation-monitor-update-workflow
       schedule:
         quartz_cron_expression: "0 0 6 ? * MON"
         timezone_id: "Europe/Amsterdam"
         pause_status: ${var.schedule_pause_status}
       tags:
-        project_name: "marvel-characters"
+        project_name: "product-price-optimisation"
 
       environments:
         - environment_key: monitor-env
