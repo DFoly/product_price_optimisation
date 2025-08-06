@@ -1,7 +1,4 @@
-"""Configuration file for the Marvel characters project."""
-
 from typing import Any
-
 import yaml
 from pydantic import BaseModel
 

@@ -8,7 +8,7 @@ from mlflow.models import infer_signature
 from mlflow.pyfunc import PythonModelContext
 from mlflow.utils.environment import _mlflow_conda_env
 
-from marvel_characters.config import Tags
+from pricing.config import Tags
 
 
 def adjust_predictions(predictions: np.ndarray | list[int]) -> dict[str, list[str]]:

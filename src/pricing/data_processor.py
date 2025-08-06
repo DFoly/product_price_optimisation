@@ -7,98 +7,87 @@ import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import current_timestamp, to_utc_timestamp
 from sklearn.model_selection import train_test_split
-
-from marvel_characters.config import ProjectConfig
+from pricing.config import ProjectConfig # handles project configuration
 
 
 class DataProcessor:
-    """A class for preprocessing and managing Marvel character DataFrame operations.
-
-    This class handles data preprocessing, splitting, and saving to Databricks tables.
+    """
     """
 
     def __init__(self, pandas_df: pd.DataFrame, config: ProjectConfig, spark: SparkSession) -> None:
         self.df = pandas_df  # Store the DataFrame as self.df
         self.config = config  # Store the configuration
         self.spark = spark
+        self.num_days_train = self.config.num_days_train
+        self.num_items_subset = self.config.num_items_subset
+        self.num_stores_subset = self.config.num_stores_subset
 
     def preprocess(self) -> None:
-        """Preprocess the Marvel character DataFrame stored in self.df.
-
-        This method handles missing values, converts data types, and performs feature engineering.
+        """Loads M5 datasets, merges them, and applies initial filtering and feature engineering.
         """
         cat_features = self.config.cat_features
         num_features = self.config.num_features
         target = self.config.target
 
-        self.df.rename(columns={"Height (m)": "Height"}, inplace=True)
-        self.df.rename(columns={"Weight (kg)": "Weight"}, inplace=True)
+        # read tables in from catalog
+        df_sales = self.spark.table(f"{self.config.catalog_name}.{self.config.schema_name}.sales")
+        df_calendar = self.spark.table(f"{self.config.catalog_name}.{self.config.schema_name}.calendar")
+        df_prices = self.spark.table(f"{self.config.catalog_name}.{self.config.schema_name}.sell_prices")
 
-        # Universe
-        self.df["Universe"] = self.df["Universe"].fillna("Unknown")
-        counts = self.df["Universe"].value_counts()
-        small_universes = counts[counts < 50].index
-        self.df["Universe"] = self.df["Universe"].replace(small_universes, "Other")
+        # Determine the sales columns to load based on num_days_train
+        all_d_cols = [col for col in df_sales.columns if col.startswith('d_')]
+        sales_d_cols = all_d_cols[-self.num_days_train:]
+        
+        # convert to long format
+        id_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id']
+        df_sales_melted = df_sales[id_cols + sales_d_cols].melt(
+            id_vars=id_cols,
+            var_name='d',
+            value_name='demand' # Renamed to 'demand' as per user's snippet
+        )
+        df_sales_melted['d'] = df_sales_melted['d'].str[2:].astype("int64")
+        df_calendar['d'] = df_calendar['d'].str[2:].astype("int64")
+        df_sales_melted['demand'] = df_sales_melted['demand'].astype("float32")
+        print(f"Sales data melted. Total rows: {len(df_sales_melted)}")
 
-        # Teams
-        self.df["Teams"] = self.df["Teams"].notna().astype("int")
+        # Merge with calendar data
+        df_merged = pd.merge(df_sales_melted, df_calendar, on='d', how='left')
+        df_merged['date'] = pd.to_datetime(df_merged['date'])
+        print("Merged with calendar data.")
 
-        # Origin
-        self.df["Origin"] = self.df["Origin"].fillna("Unknown")
+        # Merge with sell_prices data
+        df_merged = pd.merge(df_merged, df_prices, on=['store_id', 'item_id', 'wm_yr_wk'], how='left')
+        df_merged = df_merged.drop(["wm_yr_wk"], axis=1) # Drop wm_yr_wk as per user's snippet
+        print("Merged with sell_prices data.")
 
-        # Identity
-        self.df["Identity"] = self.df["Identity"].fillna("Unknown")
-        self.df = self.df[self.df["Identity"].isin(["Public", "Secret", "Unknown"])]
+        # Filter to a manageable subset for demonstration
+        selected_items = df_sales['item_id'].unique()[:self.num_items_subset]
+        selected_stores = df_sales['store_id'].unique()[:self.num_stores_subset]
 
-        # Gender
-        self.df["Gender"] = self.df["Gender"].fillna("Unknown")
-        self.df["Gender"] = self.df["Gender"].where(self.df["Gender"].isin(["Male", "Female"]), other="Other")
+        df_filtered = df_merged[
+            (df_merged['item_id'].isin(selected_items)) &
+            (df_merged['store_id'].isin(selected_stores))
+        ].copy()
+        
+        # Fill missing sell_price values (as done in previous code)
+        df_filtered['sell_price'] = df_filtered.groupby(['id'])['sell_price'].transform(lambda x: x.ffill().bfill())
+        df_filtered['sell_price'].fillna(df_filtered['sell_price'].mean(), inplace=True)
+        print("Filled missing sell_price values.")
 
-        # Marital status
-        self.df.rename(columns={"Marital Status": "Marital_Status"}, inplace=True)
-        self.df["Marital_Status"] = self.df["Marital_Status"].fillna("Unknown")
-        self.df["Marital_Status"] = self.df["Marital_Status"].replace("Widow", "Widowed")
-        self.df = self.df[self.df["Marital_Status"].isin(["Single", "Married", "Widowed", "Engaged", "Unknown"])]
+        # Calculate `days_since_first_sale`
+        df_filtered['first_sale_date'] = df_filtered.groupby('id')['date'].transform('min')
+        df_filtered['days_since_first_sale'] = (df_filtered['date'] - df_filtered['first_sale_date']).dt.days
+        print("Calculated days_since_first_sale.")
 
-        # Magic
-        self.df["Magic"] = self.df["Origin"].str.lower().apply(lambda x: int("magic" in x))
+        print(f"\nFiltered dataset to {num_items_subset} items and {num_stores_subset} stores.")
+        print(f"Total rows in filtered data: {len(df_filtered)}")
+        print("Sample Filtered Data Head:")
+        print(df_filtered.head())
+        
+        return df_filtered, df_calendar
 
-        # Mutant
-        self.df["Mutant"] = self.df["Origin"].str.lower().apply(lambda x: int("mutate" in x or "mutant" in x))
+      
 
-        # Normalize origin
-        def normalize_origin(x: str) -> str:
-            x_lower = str(x).lower()
-            if "human" in x_lower:
-                return "Human"
-            elif "mutate" in x_lower or "mutant" in x_lower:
-                return "Mutant"
-            elif "asgardian" in x_lower:
-                return "Asgardian"
-            elif "alien" in x_lower:
-                return "Alien"
-            elif "symbiote" in x_lower:
-                return "Symbiote"
-            elif "robot" in x_lower:
-                return "Robot"
-            elif "cosmic being" in x_lower:
-                return "Cosmic Being"
-            else:
-                return "Other"
-
-        self.df["Origin"] = self.df["Origin"].apply(normalize_origin)
-
-        self.df = self.df[self.df["Alive"].isin(["Alive", "Dead"])]
-        self.df["Alive"] = (self.df["Alive"] == "Alive").astype(int)
-
-        self.df = self.df[num_features + cat_features + [target] + ["PageID"]]
-
-        for col in cat_features:
-            self.df[col] = self.df[col].astype("category")
-        # Rename PageID to Id for consistency
-        if "PageID" in self.df.columns:
-            self.df = self.df.rename(columns={"PageID": "Id"})
-            self.df["Id"] = self.df["Id"].astype("str")
 
     def split_data(self, test_size: float = 0.2, random_state: int = 42) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Split the DataFrame (self.df) into training and test sets.
@@ -111,7 +100,8 @@ class DataProcessor:
         return train_set, test_set
 
     def save_to_catalog(self, train_set: pd.DataFrame, test_set: pd.DataFrame) -> None:
-        """Save the train and test sets into Databricks tables.
+        """
+         Save the train and test sets into Databricks tables.
 
         :param train_set: The training DataFrame to be saved.
         :param test_set: The test DataFrame to be saved.
@@ -148,69 +138,3 @@ class DataProcessor:
         )
 
 
-def generate_synthetic_data(df: pd.DataFrame, drift: bool = False, num_rows: int = 500) -> pd.DataFrame:
-    """Generate synthetic Marvel character data matching input DataFrame distributions with optional drift.
-
-    Creates artificial dataset replicating statistical patterns from source columns including numeric,
-    categorical, and datetime types. Supports intentional data drift for specific features when enabled.
-
-    :param df: Source DataFrame containing original data distributions
-    :param drift: Flag to activate synthetic data drift injection
-    :param num_rows: Number of synthetic records to generate
-    :return: DataFrame containing generated synthetic data
-    """
-    synthetic_data = pd.DataFrame()
-
-    for column in df.columns:
-        if column == "Id":
-            continue
-
-        if pd.api.types.is_numeric_dtype(df[column]):
-            if column in {"Height", "Weight"}:  # Handle physical attributes
-                synthetic_data[column] = np.random.normal(df[column].mean(), df[column].std(), num_rows)
-                # Ensure positive values for physical attributes
-                synthetic_data[column] = np.maximum(0.1, synthetic_data[column])
-            else:
-                synthetic_data[column] = np.random.normal(df[column].mean(), df[column].std(), num_rows)
-
-        elif pd.api.types.is_categorical_dtype(df[column]) or pd.api.types.is_object_dtype(df[column]):
-            synthetic_data[column] = np.random.choice(
-                df[column].unique(), num_rows, p=df[column].value_counts(normalize=True)
-            )
-
-        elif pd.api.types.is_datetime64_any_dtype(df[column]):
-            min_date, max_date = df[column].min(), df[column].max()
-            synthetic_data[column] = pd.to_datetime(
-                np.random.randint(min_date.value, max_date.value, num_rows)
-                if min_date < max_date
-                else [min_date] * num_rows
-            )
-
-        else:
-            synthetic_data[column] = np.random.choice(df[column], num_rows)
-
-    # Convert relevant numeric columns to appropriate types
-    float_columns = {"Height", "Weight"}
-    for col in float_columns.intersection(df.columns):
-        synthetic_data[col] = synthetic_data[col].astype(np.float64)
-
-    timestamp_base = int(time.time() * 1000)
-    synthetic_data["Id"] = [str(timestamp_base + i) for i in range(num_rows)]
-
-    if drift:
-        # Skew the physical attributes to introduce drift
-        drift_features = ["Height", "Weight"]
-        for feature in drift_features:
-            if feature in synthetic_data.columns:
-                synthetic_data[feature] = synthetic_data[feature] * 1.5
-
-        # Introduce bias in categorical features
-        if "Gender" in synthetic_data.columns:
-            synthetic_data["Gender"] = np.random.choice(["Male", "Female"], num_rows, p=[0.7, 0.3])
-
-    return synthetic_data
-
-
-def generate_test_data(df: pd.DataFrame, drift: bool = False, num_rows: int = 100) -> pd.DataFrame:
-    """Generate test data matching input DataFrame distributions with optional drift."""
-    return generate_synthetic_data(df, drift, num_rows)
