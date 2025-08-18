@@ -13,12 +13,13 @@ experiment_name_basic: /Shared/product-price-optimisation-basic
 experiment_name_custom: /Shared/product-price-optimisation-custom
 
 parameters:
-  num_days_train: 365*2
+  num_days_train: 730
   num_items_subset: 10
   num_stores_subset: 10
   learning_rate: 0.01
   n_estimators: 1000
   max_depth: 6
+  testing: true
 
 
 num_features:

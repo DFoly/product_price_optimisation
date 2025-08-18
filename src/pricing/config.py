@@ -19,6 +19,7 @@ class ProjectConfig(BaseModel):
     experiment_name_basic: str | None
     experiment_name_custom: str | None
 
+
     @classmethod
     def from_yaml(cls, config_path: str, env: str = "dev") -> "ProjectConfig":
         """Load and parse configuration settings from a YAML file.

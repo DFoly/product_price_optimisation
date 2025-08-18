@@ -3,7 +3,7 @@
 import os
 
 from databricks.sdk import WorkspaceClient
-
+from pyspark.sql.functions import current_timestamp, to_utc_timestamp
 
 def is_databricks() -> str:
     """Check if the code is running in a Databricks environment."""
