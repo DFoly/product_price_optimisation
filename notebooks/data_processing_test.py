@@ -84,30 +84,34 @@ spark = DatabricksSession.builder.getOrCreate() # allows to switch between local
 # COMMAND ----------
 
 data_processor = DataProcessor(config, spark)
-# Preprocess the data
-df = data_processor.preprocess()
+# # Preprocess the data
+# df = data_processor.preprocess()
+
+table_name = f"{data_processor.config.catalog_name}.{data_processor.config.schema_name}.price_features"
 
 # COMMAND ----------
 
-fe_instance = FeatureProducer(spark)
-df_features = fe_instance.generate_features_spark(df)
+# fe_instance = FeatureProducer(spark)
+# df_features = fe_instance.generate_features_spark(df)
 
-table_name = f"{data_processor.config.catalog_name}.{data_processor.config.schema_name}.price_features"
-fe_instance.publish_features(df_features, table_name, create_table=True)
+
+# fe_instance.publish_features(df_features, table_name, create_table=True)
 # display(df_features)
 
 # COMMAND ----------
 
-# MAGIC %sql select * from dev.price_optimisation.price_features where wday IS NULL
+# %sql select * from dev.price_optimisation.price_features where wday IS NULL
 
 # COMMAND ----------
 
 fe = FeatureEngineeringClient()
 
-feature_names = ['wday', 'month', 'year', 'dayofweek', 'dayofyear', 'week', 'snap_CA', 'snap_TX', 'snap_WI', 'sell_price', 'days_since_first_sale', 'is_event', 'lag_t7', 'rolling_mean_lag7_w7', 'lag_t28', 'rolling_mean_lag28_w7', 'item_running_avg', 'store_running_avg']
+feature_names = ['wday', 'month', 'year', 'dayofweek', 'dayofyear', 'week', 'snap_CA', 'snap_TX', 'snap_WI', 
+                 'sell_price', 'days_since_first_sale', 'is_event', 'lag_t7', 'rolling_mean_lag7_w7', 'lag_t28', 'rolling_mean_lag28_w7', 'item_running_avg', 'store_running_avg']
 
 # need to pass to feature store create training set
 # this could be a separate table which stores the demand per unique id and date
+df_features = spark.sql(f"select * from {table_name}")
 training_df = df_features.select('item_store_id', 'date', 'demand').drop_duplicates()
 
 feature_lookups = [
@@ -130,10 +134,53 @@ training_set = fe.create_training_set(
     label="demand",
 )
 training_df = training_set.load_df()
+training_df_pd = training_df.toPandas()
 
 # COMMAND ----------
 
-display(training_df)
+# MAGIC %md
+# MAGIC ### Baseline Demand Model
+# MAGIC - estimate baseline demand without sell price
+
+# COMMAND ----------
+
+from lightgbm import LGBMRegressor
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.metrics import mean_squared_error, make_scorer
+import numpy as np
+
+# Feature columns (input): excluding sell_price to estimate base demand
+feature_names = ['wday', 'month', 'year', 'dayofweek', 'dayofyear', 'week', 
+                 'snap_CA', 'snap_TX', 'snap_WI', 
+                 'days_since_first_sale', 'is_event',
+                 'lag_t7', 'rolling_mean_lag7_w7',
+                 'lag_t28', 'rolling_mean_lag28_w7',
+                 'item_running_avg', 'store_running_avg']
+
+X = training_df_pd[feature_names]
+y = training_df_pd['demand']
+
+# LGBMRegressor setup: Poisson objective
+lgbm = LGBMRegressor(objective='poisson')
+
+# RMSE scorer for cross-validation
+rmse_scorer = make_scorer(mean_squared_error, squared=False)
+
+# 5-fold cross validation (shuffle for randomness)
+kf = KFold(n_splits=2, shuffle=True, random_state=42)
+
+cv_rmse_scores = cross_val_score(
+    lgbm,
+    X,
+    y,
+    cv=kf,
+    scoring=rmse_scorer,
+    n_jobs=-1
+)
+
+print("Cross-validated RMSE scores:", cv_rmse_scores)
+print("Mean CV RMSE:", np.mean(cv_rmse_scores))
+print("Std CV RMSE:", np.std(cv_rmse_scores))
 
 # COMMAND ----------
 

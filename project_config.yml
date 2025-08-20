@@ -2,7 +2,7 @@ prd:
   catalog_name: prod
   schema_name: price_optimisation
 test:
-  catalog_name: test
+  catalog_name: acc
   schema_name: price_optimisation
 dev:
   catalog_name: dev
@@ -23,17 +23,25 @@ parameters:
 
 
 num_features:
-  - Height
-  - Weight
+  - wday
+  - month
+  - year
+  - dayofweek
+  - dayofyear
+  - week
+  - days_since_first_sale
+  - lag_t7
+  - rolling_mean_lag7_w7
+  - lag_t28
+  - rolling_mean_lag28_w7
+  - item_running_avg
+  - store_running_avg
 
 cat_features:
-  - Universe
-  - Identity
-  - Gender
-  - Marital_Status
-  - Teams
-  - Origin
-  - Magic
-  - Mutant
+  - snap_CA
+  - snap_TX
+  - snap_WI
+  - is_event
 
-target: sales
+
+target: demand
