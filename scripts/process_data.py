@@ -33,20 +33,17 @@ config = ProjectConfig.from_yaml(config_path=config_path, env=args.env)
 logger.info("Configuration loaded:")
 logger.info(yaml.dump(config, default_flow_style=False))
 
-# Load the Marvel characters dataset
 spark = SparkSession.builder.getOrCreate()
 
 # Initialize DataProcessor
-data_processor = DataProcessor(df, config, spark)
+data_processor = DataProcessor(config, spark)
 
 # Preprocess the data
-data_processor.preprocess()
+df = data_processor.preprocess()
 
-# Split the data
-X_train, X_test = data_processor.split_data()
-logger.info("Training set shape: %s", X_train.shape)
-logger.info("Test set shape: %s", X_test.shape)
+# feature engineering and feature store
+fe_instance = FeatureProducer(spark)
+df_features = fe_instance.generate_features_spark(df)
 
-# Save to catalog
-logger.info("Saving data to catalog")
-data_processor.save_to_catalog(X_train, X_test)
+table_name = f"{data_processor.config.catalog_name}.{data_processor.config.schema_name}.price_features"
+fe_instance.publish_features(df_features, table_name, create_table=True)

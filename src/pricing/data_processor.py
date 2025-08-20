@@ -35,7 +35,7 @@ class DataProcessor:
         # Determine the sales columns to load based on num_days_train
         all_d_cols = [col for col in df_sales.columns if col.startswith('d_')]
         sales_d_cols = all_d_cols[-self.num_days_train:]
-        id_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id']
+        id_cols = ['item_id', 'dept_id', 'cat_id', 'store_id', 'state_id']
 
         df_sales_selected = df_sales.select(id_cols + sales_d_cols)
         df_sales_melted = (
@@ -49,9 +49,6 @@ class DataProcessor:
             .withColumn("d", F.expr("int(substr(d, 3, length(d)))"))
             .withColumn("demand", F.col("demand").cast("float"))
         )
-
-        # Prepare calendar
-        df_calendar = df_calendar.withColumn("d", F.expr("int(substr(d, 3, length(d)-2))"))
 
         # Merge with calendar and sell_prices
         df_merged = (
@@ -73,6 +70,13 @@ class DataProcessor:
         else:
             df_filtered = df_merged
 
+        # create id columns to use as primary key: also  # ITEM STORE IDENTIFIER
+        df_filtered = (
+            df_filtered
+            .withColumn("id", F.concat(F.col("item_id"), F.lit("_"), F.col("store_id"), F.lit("_"), F.col('date')))
+            .withColumn("item_store_id", F.concat(F.col("item_id"), F.lit("_"), F.col("store_id")))
+        )
+
         # get average by window and then coalesce: average up to current row
         window_spec = Window.partitionBy("item_id").orderBy("date").rowsBetween(Window.unboundedPreceding, Window.currentRow-1)
         df_filtered = df_filtered.withColumn("sell_price", F.coalesce("sell_price", F.mean("sell_price").over(window_spec)))
@@ -91,7 +95,6 @@ class DataProcessor:
         print(f"\nFiltered dataset to {self.num_items_subset} items and {self.num_stores_subset} stores.")
         print(f"Total rows in filtered data: {df_filtered.count()}")
         print("Sample Filtered Data Head:")
-        df_filtered.show(5)
 
         self.df = df_filtered
         return self.df
@@ -133,23 +136,6 @@ class DataProcessor:
         )
 
 
-    def enable_change_data_feed(self) -> None:
-        """Enable Change Data Feed for train and test set tables.
-
-        This method alters the tables to enable Change Data Feed functionality.
-        """
-        self.spark.sql(
-            f"ALTER TABLE {self.config.catalog_name}.{self.config.schema_name}.train_set "
-            "SET TBLPROPERTIES (delta.enableChangeDataFeed = true);"
-        )
-
-        self.spark.sql(
-            f"ALTER TABLE {self.config.catalog_name}.{self.config.schema_name}.test_set "
-            "SET TBLPROPERTIES (delta.enableChangeDataFeed = true);"
-        )
-
-
-
 class FeatureProducer:
     """
     Generate features and save them in databricks feature store
@@ -184,49 +170,73 @@ class FeatureProducer:
         # Sort the data by id and date for correct windowing
         df_sorted = df_with_time_features.sort(F.col("id"), F.col("date"))
         
+        lag_cols = []
+        roll_cols = []
+
         for lag in self.lags:
-            window_spec_lag = Window.partitionBy("id").orderBy("date")
+            window_spec_lag = Window.partitionBy("item_store_id").orderBy("date")
+            lag_col_name = f'lag_t{lag}'
             df_lagged = df_sorted.withColumn(
-                f'lag_t{lag}', F.lag("demand", lag).over(window_spec_lag).cast("float")
+                lag_col_name, F.lag("demand", lag).over(window_spec_lag).cast("float")
             )
+            lag_cols.append(lag_col_name)
             # Add rolling means for the newly created lag feature
             for w in self.windows:
-                window_spec_roll = Window.partitionBy("id").orderBy("date").rowsBetween(-w, -1)
+                roll_col_name = f'rolling_mean_lag{lag}_w{w}'
+                window_spec_roll = Window.partitionBy("item_store_id").orderBy("date").rowsBetween(-w, -1)
                 df_lagged = df_lagged.withColumn(
-                    f'rolling_mean_lag{lag}_w{w}', F.avg(f'lag_t{lag}').over(window_spec_roll).cast("float")
+                    roll_col_name, F.avg(lag_col_name).over(window_spec_roll).cast("float")
                 )
+                roll_cols.append(roll_col_name)
             df_sorted = df_lagged
-        
+
+        # add summary stats: running average etc
+        item_window_spec =  Window.partitionBy("item_id").orderBy("date").rowsBetween(Window.unboundedPreceding, 0)
+        store_window_spec =  Window.partitionBy("store_id").orderBy("date").rowsBetween(Window.unboundedPreceding, 0)
+
+        df_sorted = (
+            df_sorted
+             .withColumn('item_running_avg', F.avg('demand').over(item_window_spec))
+             .withColumn('store_running_avg', F.avg('demand').over(store_window_spec))
+        )
+
+        # Add timestamps etc.
         df_final = df_sorted.withColumn(
             "event_timestamp", F.to_timestamp("date")
         ).withColumn(
             "update_timestamp_utc", to_utc_timestamp(current_timestamp(), "UTC")
         )
-        
-        df_final.printSchema()
-        return df_final
+
+        # Remove rows with nulls in any of the new lag/rolling columns
+        cols_to_check_nulls = lag_cols + roll_cols
+        df_final_cleaned = df_final.dropna(subset=cols_to_check_nulls)
+        return df_final_cleaned
 
 
-    def publish_features(self, df_features, table_name, create_table=True):
+    def publish_features(self, df_features, table_name):
         """
         Publishes the generated features to a Databricks Feature Store table.
+        https://docs.databricks.com/aws/en/machine-learning/feature-store/time-series
         """
         print(f"Publishing features to table: {table_name}")
-        if create_table:
-            self.fe.create_table(
-                name=table_name,
-                df=df_features,
-                primary_keys=["id", "date"],
-                partition_columns=["date"],
-                description="Time-series and sales features for M5 forecasting.",
-                mode="overwrite" # 'merge' for incremental updates
-            )
-        else:
+        try:
+            # Try to get the table; if it exists this succeeds
+            self.fe.get_table(name=table_name)
             self.fe.write_table(
                 name=table_name,
                 df=df_features,
-                primary_keys=["id", "date"],
-                partition_columns=["date"],
+                primary_keys=["item_store_id", "date"],
+                timeseries_columns=['date'],
                 description="Updating features for M5 forecasting.",
-                mode="overwrite" 
+                mode="overwrite"
+            )
+            print("Table existed. Overwritten.")
+        except ValueError:
+            # Table does not exist: Create
+            self.fe.create_table(
+                name=table_name,
+                df=df_features,
+                primary_keys=["item_store_id", "date"],
+                timeseries_columns=['date'],
+                description="Time-series and sales features for M5 forecasting.",
             )
