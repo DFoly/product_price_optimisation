@@ -1,3 +1,4 @@
+# This would be part of a daily data pipeline that takes in new data creates a features and updates our feature store
 import time
 import sys
 import numpy as np
@@ -6,7 +7,7 @@ from databricks.connect import DatabricksSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from pyspark.sql.functions import current_timestamp, to_utc_timestamp
-from pricing.config import ProjectConfig # handles project configuration
+from src.pricing.config import ProjectConfig
 from databricks.feature_engineering import FeatureEngineeringClient
 
 
@@ -21,7 +22,7 @@ class DataProcessor:
         self.num_items_subset = self.config.parameters['num_items_subset']
         self.num_stores_subset = self.config.parameters['num_stores_subset']
         self.split_date = pd.to_datetime("2016-04-25")  # Default split date
-        self.testing = self.config.parameters.get('testing', False)  
+        self.testing = self.config.parameters.get('testing', False)
 
 
     def preprocess(self):
@@ -61,6 +62,7 @@ class DataProcessor:
 
         if self.testing:
             # Filter to a manageable subset for testing
+            print(f"\nFiltered dataset to {self.num_items_subset} items and {self.num_stores_subset} stores.")
             selected_items = [row.item_id for row in df_sales.select("item_id").distinct().limit(self.num_items_subset).collect()]
             selected_stores = [row.store_id for row in df_sales.select("store_id").distinct().limit(self.num_stores_subset).collect()]
             df_filtered = df_merged.filter(
@@ -70,11 +72,13 @@ class DataProcessor:
         else:
             df_filtered = df_merged
 
-        # create id columns to use as primary key: also  # ITEM STORE IDENTIFIER
+        # create id column: concat(item_id, store_id)
+        # create primary key: pk_id = concat(item_id, store_id, date)
+        # ITEM STORE IDENTIFIER: HOBBIES_1_001_CA_1
         df_filtered = (
             df_filtered
-            .withColumn("id", F.concat(F.col("item_id"), F.lit("_"), F.col("store_id"), F.lit("_"), F.col('date')))
-            .withColumn("item_store_id", F.concat(F.col("item_id"), F.lit("_"), F.col("store_id")))
+            .withColumn("id_pk", F.concat(F.col("item_id"), F.lit("_"), F.col("store_id"), F.lit("_"), F.col('date')))
+            .withColumn("id", F.concat(F.col("item_id"), F.lit("_"), F.col("store_id")))
         )
 
         # get average by window and then coalesce: average up to current row
@@ -91,10 +95,7 @@ class DataProcessor:
             "days_since_first_sale",
             F.datediff(F.col("date"), F.col("first_sale_date"))
         )
-
-        print(f"\nFiltered dataset to {self.num_items_subset} items and {self.num_stores_subset} stores.")
         print(f"Total rows in filtered data: {df_filtered.count()}")
-        print("Sample Filtered Data Head:")
 
         self.df = df_filtered
         return self.df
@@ -142,9 +143,16 @@ class FeatureProducer:
     """
     def __init__(self, spark: DatabricksSession):
         self.spark=spark
-        self.lags = [7, 28]
+        self.lags = [7, 14, 28]
         self.windows = [7]
         self.fe = FeatureEngineeringClient()
+
+    def label_encoder():
+        """
+            Handle the categorical data
+        """
+        pass
+
 
     def generate_features_spark(self, df_input):
         """
@@ -174,7 +182,7 @@ class FeatureProducer:
         roll_cols = []
 
         for lag in self.lags:
-            window_spec_lag = Window.partitionBy("item_store_id").orderBy("date")
+            window_spec_lag = Window.partitionBy("id").orderBy("date")
             lag_col_name = f'lag_t{lag}'
             df_lagged = df_sorted.withColumn(
                 lag_col_name, F.lag("demand", lag).over(window_spec_lag).cast("float")
@@ -183,7 +191,7 @@ class FeatureProducer:
             # Add rolling means for the newly created lag feature
             for w in self.windows:
                 roll_col_name = f'rolling_mean_lag{lag}_w{w}'
-                window_spec_roll = Window.partitionBy("item_store_id").orderBy("date").rowsBetween(-w, -1)
+                window_spec_roll = Window.partitionBy("id").orderBy("date").rowsBetween(-w, -1)
                 df_lagged = df_lagged.withColumn(
                     roll_col_name, F.avg(lag_col_name).over(window_spec_roll).cast("float")
                 )
@@ -221,13 +229,11 @@ class FeatureProducer:
         print(f"Publishing features to table: {table_name}")
         try:
             # Try to get the table; if it exists this succeeds
+            # what is the default behaviour if the keys already exisit? i.e. will it be an upsert?
             self.fe.get_table(name=table_name)
             self.fe.write_table(
                 name=table_name,
                 df=df_features,
-                primary_keys=["item_store_id", "date"],
-                timeseries_columns=['date'],
-                description="Updating features for M5 forecasting.",
                 mode="overwrite"
             )
             print("Table existed. Overwritten.")
@@ -236,7 +242,7 @@ class FeatureProducer:
             self.fe.create_table(
                 name=table_name,
                 df=df_features,
-                primary_keys=["item_store_id", "date"],
+                primary_keys=["id", "date"],
                 timeseries_columns=['date'],
                 description="Time-series and sales features for M5 forecasting.",
             )
