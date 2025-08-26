@@ -5,9 +5,9 @@
 # COMMAND ----------
 
 # fix path for imports
-from pathlib import Path
-import sys
-sys.path.append(str(Path.cwd().parent / 'src'))
+# from pathlib import Path
+# import sys
+# sys.path.append(str(Path.cwd().parent / 'src'))
 
 # COMMAND ----------
 
@@ -20,22 +20,25 @@ import pyspark.sql.functions as F
 
 import mlflow
 import mlflow.tracking._model_registry.utils
-import pricing
-from pricing.config import ProjectConfig
-from pricing.data_processor import DataProcessor, FeatureProducer
+import src.pricing
+from src.pricing.config import ProjectConfig
+from src.pricing.data_processor import DataProcessor, FeatureProducer
 
 # Workaround to set the registry URI manually: fixes issue with feature engineering
 # mlflow.tracking._model_registry.utils._get_registry_uri_from_spark_session = lambda: "databricks-uc"
 from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
 
-config = ProjectConfig.from_yaml(config_path="../project_config.yml", env="dev")
+config = ProjectConfig.from_yaml(config_path="../project_config.yml", env="dev") # Ensure 'num_features' is defined in the YAML
 
 logger.info("Configuration loaded:")
 logger.info(yaml.dump(config, default_flow_style=False))
 
-importlib.reload(pricing.data_processor)
+importlib.reload(src.pricing.data_processor)
 
 spark = DatabricksSession.builder.getOrCreate() # allows to switch between local and remote Spark clusters
+
+%load_ext autoreload
+%autoreload 2
 
 # COMMAND ----------
 
@@ -85,22 +88,42 @@ spark = DatabricksSession.builder.getOrCreate() # allows to switch between local
 
 data_processor = DataProcessor(config, spark)
 # # Preprocess the data
-# df = data_processor.preprocess()
+df = data_processor.preprocess()
 
 table_name = f"{data_processor.config.catalog_name}.{data_processor.config.schema_name}.price_features"
+print(table_name)
 
 # COMMAND ----------
 
-# fe_instance = FeatureProducer(spark)
-# df_features = fe_instance.generate_features_spark(df)
-
-
-# fe_instance.publish_features(df_features, table_name, create_table=True)
-# display(df_features)
+# %sql drop table dev.price_optimisation.price_features
 
 # COMMAND ----------
 
-# %sql select * from dev.price_optimisation.price_features where wday IS NULL
+fe_instance = FeatureProducer(spark)
+df_features = fe_instance.generate_features_spark(df)
+
+fe_instance.publish_features(df_features, table_name)
+display(df_features.limit(10))
+
+# COMMAND ----------
+
+print(df.count()), print(df_features.count())
+
+# COMMAND ----------
+
+display(df_features.agg(F.countDistinct('id')))
+
+# COMMAND ----------
+
+# MAGIC %sql select count(distinct id) from dev.price_optimisation.price_features
+
+# COMMAND ----------
+
+# MAGIC %sql select * from dev.price_optimisation.price_features order by id, date asc limit 100
+
+# COMMAND ----------
+
+# %sql drop table dev.price_optimisation.price_features
 
 # COMMAND ----------
 
@@ -112,7 +135,7 @@ feature_names = ['wday', 'month', 'year', 'dayofweek', 'dayofyear', 'week', 'sna
 # need to pass to feature store create training set
 # this could be a separate table which stores the demand per unique id and date
 df_features = spark.sql(f"select * from {table_name}")
-training_df = df_features.select('item_store_id', 'date', 'demand').drop_duplicates()
+training_df = df_features.select('id', 'date', 'demand').drop_duplicates()
 
 feature_lookups = [
     FeatureLookup(
@@ -144,43 +167,52 @@ training_df_pd = training_df.toPandas()
 
 # COMMAND ----------
 
-from lightgbm import LGBMRegressor
-from sklearn.model_selection import KFold, cross_val_score
-from sklearn.metrics import mean_squared_error, make_scorer
-import numpy as np
+import mlflow
 
-# Feature columns (input): excluding sell_price to estimate base demand
-feature_names = ['wday', 'month', 'year', 'dayofweek', 'dayofyear', 'week', 
-                 'snap_CA', 'snap_TX', 'snap_WI', 
-                 'days_since_first_sale', 'is_event',
-                 'lag_t7', 'rolling_mean_lag7_w7',
-                 'lag_t28', 'rolling_mean_lag28_w7',
-                 'item_running_avg', 'store_running_avg']
+with mlflow.start_run(run_name="baseline_demand_lgbm"):
+    mlflow.log_params({"model": "LGBMRegressor", "objective": "poisson", "cv_folds": 4})
+    from lightgbm import LGBMRegressor
+    from sklearn.model_selection import KFold, cross_val_score
+    from sklearn.metrics import mean_squared_error, make_scorer
+    import numpy as np
 
-X = training_df_pd[feature_names]
-y = training_df_pd['demand']
+    # Feature columns (input): excluding sell_price to estimate base demand
+    feature_names = ['wday', 'month', 'year', 'dayofweek', 'dayofyear', 'week', 
+                     'snap_CA', 'snap_TX', 'snap_WI', 
+                     'days_since_first_sale', 'is_event',
+                     'lag_t7', 'rolling_mean_lag7_w7',
+                     'lag_t28', 'rolling_mean_lag28_w7',
+                     'item_running_avg', 'store_running_avg']
 
-# LGBMRegressor setup: Poisson objective
-lgbm = LGBMRegressor(objective='poisson')
+    X = training_df_pd[feature_names]
+    y = training_df_pd['demand']
 
-# RMSE scorer for cross-validation
-rmse_scorer = make_scorer(mean_squared_error, squared=False)
+    # LGBMRegressor setup: Poisson objective
+    lgbm = LGBMRegressor(objective='poisson')
 
-# 5-fold cross validation (shuffle for randomness)
-kf = KFold(n_splits=2, shuffle=True, random_state=42)
+    # RMSE scorer for cross-validation
+    rmse_scorer = make_scorer(mean_squared_error, squared=False)
 
-cv_rmse_scores = cross_val_score(
-    lgbm,
-    X,
-    y,
-    cv=kf,
-    scoring=rmse_scorer,
-    n_jobs=-1
-)
+    # 5-fold cross validation (shuffle for randomness)
+    kf = KFold(n_splits=4, shuffle=True, random_state=42)
 
-print("Cross-validated RMSE scores:", cv_rmse_scores)
-print("Mean CV RMSE:", np.mean(cv_rmse_scores))
-print("Std CV RMSE:", np.std(cv_rmse_scores))
+    cv_rmse_scores = cross_val_score(
+        lgbm,
+        X,
+        y,
+        cv=kf,
+        scoring=rmse_scorer,
+        n_jobs=-1
+    )
+
+    mlflow.log_metric("mean_cv_rmse", np.mean(cv_rmse_scores))
+    mlflow.log_metric("std_cv_rmse", np.std(cv_rmse_scores))
+    for i, score in enumerate(cv_rmse_scores):
+        mlflow.log_metric(f"cv_rmse_fold_{i+1}", score)
+
+    print("Cross-validated RMSE scores:", cv_rmse_scores)
+    print("Mean CV RMSE:", np.mean(cv_rmse_scores))
+    print("Std CV RMSE:", np.std(cv_rmse_scores))
 
 # COMMAND ----------
 

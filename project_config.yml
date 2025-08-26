@@ -8,40 +8,68 @@ dev:
   catalog_name: dev
   schema_name: price_optimisation
 
-
-experiment_name_basic: /Shared/product-price-optimisation-basic
-experiment_name_custom: /Shared/product-price-optimisation-custom
+experiment_name_basic: /Shared/product-price-optimisation-model
 
 parameters:
   num_days_train: 730
   num_items_subset: 10
   num_stores_subset: 10
-  learning_rate: 0.01
-  n_estimators: 1000
-  max_depth: 6
-  testing: true
+  testing: False
 
+# LightGBM Model Parameters
+LGBM_FORECAST_PARAMS:
+  metric: rmse
+  objective: poisson
+  seed: 42
+  force_row_wise: true
+  learning_rate: 0.08
+  lambda_l1: 0.1
+  num_leaves: 63
+  subsample: 0.7
+  bagging_freq: 1
+  colsample_bytree: 0.7
+  n_estimators: 2000
+  n_jobs: -1
+
+LGBM_ELASTICITY_PARAMS:
+  metric: rmse
+  objective: poisson
+  seed: 42
+  force_row_wise: true
+  learning_rate: 0.05
+  lambda_l1: 0.05
+  num_leaves: 31
+  subsample: 0.8
+  bagging_freq: 1
+  colsample_bytree: 0.8
+  n_estimators: 1500
+  n_jobs: -1
 
 num_features:
-  - wday
-  - month
-  - year
-  - dayofweek
-  - dayofyear
-  - week
-  - days_since_first_sale
-  - lag_t7
-  - rolling_mean_lag7_w7
-  - lag_t28
-  - rolling_mean_lag28_w7
-  - item_running_avg
-  - store_running_avg
+  forecast:
+    - wday
+    - month
+    - year
+    - dayofweek
+    - dayofyear
+    - week
+    - days_since_first_sale
+    - demand_lag_t7
+    - price_lag_t7
+    - rolling_mean_lag7_w7
+    - demand_lag_t28
+    - price_lag_t28
+    - rolling_mean_lag28_w7
+    - item_running_avg
+    - store_running_avg
+    - sell_price
+    - baseline_price
+    - price_ratio
 
 cat_features:
   - snap_CA
   - snap_TX
   - snap_WI
   - is_event
-
 
 target: demand
