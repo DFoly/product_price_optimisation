@@ -54,27 +54,17 @@ num_features:
     - dayofyear
     - week
     - days_since_first_sale
-    - lag_t7
+    - demand_lag_t7
+    - price_lag_t7
     - rolling_mean_lag7_w7
-    - lag_t28
-    - rolling_mean_lag28_w7
-    - item_running_avg
-    - store_running_avg
-  elasticity:
-    - wday
-    - month
-    - year
-    - dayofweek
-    - dayofyear
-    - week
-    - days_since_first_sale
-    - lag_t7
-    - rolling_mean_lag7_w7
-    - lag_t28
+    - demand_lag_t28
+    - price_lag_t28
     - rolling_mean_lag28_w7
     - item_running_avg
     - store_running_avg
     - sell_price
+    - baseline_price
+    - price_ratio
 
 cat_features:
   - snap_CA

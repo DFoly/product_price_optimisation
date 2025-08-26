@@ -5,6 +5,8 @@ import pandas as pd
 import mlflow
 import mlflow.pyfunc
 from mlflow.models import infer_signature
+from mlflow import MlflowClient
+from loguru import logger
 from databricks.connect import DatabricksSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
@@ -20,7 +22,7 @@ class LGBMModel:
     Base Model for both forecasting and elasticity models.
     This class now uses a pre-computed training DataFrame from the Feature Store.
     """
-    def __init__(self, spark, config, params, model_type, training_df: pd.DataFrame):
+    def __init__(self, spark, config, params, model_type, training_df: pd.DataFrame, baseline_forecasts_daily_dict: dict):
         self.spark = spark
         self.config = config
         self.params = params
@@ -31,14 +33,60 @@ class LGBMModel:
         self.catalog_name = self.config.catalog_name
         self.schema_name = self.config.schema_name
         self.experiment_name = self.config.experiment_name_basic + '-' + self.model_type
-        self.model_name = f"{self.catalog_name}.{self.schema_name}.baseline_demand_model"
+        self.model_name = f"{self.catalog_name}.{self.schema_name}" + '.' + self.model_type
 
         self.num_features =  self.config.num_features[self.model_type]
         self.features = self.num_features + self.categorical_features
+        
+        # Store baseline forecasts for elasticity model data preparation
+        self.baseline_forecasts_daily_dict = baseline_forecasts_daily_dict
+        
+        # Prepare the data differently based on model type
+        self.training_df_pandas = self._prepare_data(training_df)
 
-        self.training_df_pandas = training_df
         self.split_date = pd.to_datetime("2016-04-25")
         self.X_train, self.X_test, self.y_train, self.y_test = self.split_data()
+
+
+    def _prepare_data(self, training_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        New method to prepare the training data based on the model type.
+        This is where the elasticity target is created.
+        """
+        if self.model_type == 'elasticity':
+            print("Preparing data for elasticity model...")
+            # We need to map the baseline forecasts to the training data.
+            def get_baseline(row):
+                key = (row['item_id'], row['store_id'], row['date'].strftime('%Y-%m-%d'))
+                return self.baseline_forecasts_daily_dict.get(key, np.nan)
+            
+            training_df['baseline_demand'] = training_df.apply(get_baseline, axis=1)
+
+            # Drop rows where we don't have a baseline forecast
+            training_df.dropna(subset=['baseline_demand'], inplace=True)
+                
+            training_df = training_df.sort_values(by=['item_id', 'store_id', 'date'])
+
+            # Baseline Price feature: avoids feature leakage using running average
+            training_df['baseline_price'] = (
+                training_df
+                .groupby(['item_id', 'store_id'])['sell_price']
+                .transform(lambda x: x.expanding().mean())
+                .shift(1)
+            )
+                        
+            # New feature for the model: price ratio
+            training_df['price_ratio'] = training_df['sell_price'] / training_df['baseline_price']
+
+            # Now, add the new features to the model's feature list
+            self.features.append('price_ratio')
+            self.features.append('baseline_demand')
+
+            # The target remains 'demand' as we are predicting the final value directly
+            return training_df
+        else:
+            # For a baseline forecast model, return the data as is.
+            return training_df
 
 
     def split_data(self):
@@ -165,6 +213,52 @@ class LGBMModel:
                 registered_model_name=registered_name,
             )
 
+        def model_improved(self) -> bool:
+            """Evaluate the model performance on the test set.
+
+            Compares the current model with the latest registered model using RMSE
+            :return: True if the current model performs better, False otherwise.
+            """
+            client = MlflowClient()
+            latest_model_version = client.get_model_version_by_alias(name=self.model_name, alias="latest-model")
+            latest_model_uri = f"models:/{latest_model_version.model_id}"
+
+            result = mlflow.models.evaluate(
+                latest_model_uri,
+                self.eval_data,
+                targets=self.config.target,
+                model_type="regression",
+                evaluators=["default"],
+            )
+            metrics_old = result.metrics
+            if self.metrics["rmse"] >= metrics_old["rmse"]:
+                logger.info("Current model performs better. Returning True.")
+                return True
+            else:
+                logger.info("Current model does not improve over latest. Returning False.")
+                return False
+
+
+        def register_model(self) -> None:
+            """Register model in Unity Catalog."""
+            logger.info("Registering the model in UC...")
+            registered_model = mlflow.register_model(
+                model_uri=f"runs:/{self.run_id}/lightgbm-pipeline-model",
+                name=self.model_name,
+                tags=self.tags,
+            )
+            logger.info(f"Model registered as version {registered_model.version}.")
+
+            latest_version = registered_model.version
+
+            client = MlflowClient()
+            client.set_registered_model_alias(
+                name=self.model_name,
+                alias="latest-model",
+                version=latest_version,
+            )
+            return latest_version
+
 
 
 class LGBMEnsembleWrapper(mlflow.pyfunc.PythonModel):
@@ -190,97 +284,3 @@ class LGBMEnsembleWrapper(mlflow.pyfunc.PythonModel):
 
         # Ensure non-negative and integer demand
         return np.maximum(0, final_preds).round(0)
-
-
-
-def predict_total_monthly_sales_for_optimization(
-    proposed_monthly_price, item_id, store_id, dept_id, cat_id, state_id,
-    first_sale_date_item_store, baseline_forecasts_daily_dict, optimization_horizon_dates_list, df_calendar_full,
-    elasticity_model_instance, feature_engineer_instance
-):
-    """
-    Predicts total sales for an item-store over the entire optimization horizon (e.g., month),
-    given a single proposed price that applies for the whole period.
-    This function orchestrates daily predictions using the elasticity model.
-    """
-    total_predicted_sales_for_month = 0
-    
-    # Create a temporary DataFrame to hold daily data for the current item-store and horizon
-    # This mimics the structure needed for feature engineering, especially lags
-    temp_df_for_daily_elasticity = pd.DataFrame(columns=feature_engineer_instance.common_base_features + 
-                                                        feature_engineer_instance.categorical_cols_raw +
-                                                        ['id', 'date', 'demand', 'first_sale_date', 'event_name_1']) # Include demand for lags
-
-    # Populate temp_df_for_daily_elasticity with context for each day in the horizon
-    for current_date_in_horizon in optimization_horizon_dates_list:
-        days_since_first_sale_current_day = (current_date_in_horizon - first_sale_date_item_store).days
-        
-        # If product not released yet, sales are 0. Don't predict.
-        if days_since_first_sale_current_day < 0:
-            continue
-
-        is_event = df_calendar_full[df_calendar_full['date'] == current_date_in_horizon]['event_name_1'].notna().any().astype(int)
-        event_name = df_calendar_full[df_calendar_full['date'] == current_date_in_horizon]['event_name_1'].iloc[0] if is_event else np.nan
-
-        # Get the specific daily baseline forecast for this (item, store, date)
-        daily_baseline_forecast = baseline_forecasts_daily_dict.get((item_id, store_id, current_date_in_horizon), 0)
-
-        # Append data for the current day to the temporary DataFrame
-        temp_df_for_daily_elasticity = pd.concat([temp_df_for_daily_elasticity, pd.DataFrame([{
-            'id': f"{item_id}_{store_id}", # Reconstruct ID for consistency
-            'item_id': item_id,
-            'store_id': store_id,
-            'dept_id': dept_id,
-            'cat_id': cat_id,
-            'state_id': state_id,
-            'date': current_date_in_horizon,
-            'first_sale_date': first_sale_date_item_store,
-            'sell_price': proposed_monthly_price, # This is the constant price for the month
-            'demand': daily_baseline_forecast, # Use baseline as initial demand for lag calculation (will be replaced by elasticity prediction)
-            'event_name_1': event_name, # For is_event feature
-            'baseline_forecast_feature': daily_baseline_forecast # Crucial feature for elasticity model
-        }])], ignore_index=True)
-
-    # Now, process the temp_df_for_daily_elasticity day by day recursively
-    # This mimics the recursive prediction logic within the forecasting model, but for elasticity
-    
-    # Ensure sorted for lag calculations
-    temp_df_for_daily_elasticity = temp_df_for_daily_elasticity.sort_values(by=['id', 'date']).reset_index(drop=True)
-
-    max_lookback_days_elasticity = max(feature_engineer_instance.lags) + max(feature_engineer_instance.windows) + 1
-
-    for tdelta in range(len(optimization_horizon_dates_list)): # Loop through the days of the horizon
-        day = optimization_horizon_dates_list[tdelta] # Get the current day from the list
-
-        # Select the window of data needed for feature generation for the current 'day'
-        # This window includes historical data (actuals or baseline) and previously predicted data.
-        tst_window_elasticity = temp_df_for_daily_elasticity[
-            (temp_df_for_daily_elasticity['date'] >= day - timedelta(days=max_lookback_days_elasticity)) &
-            (temp_df_for_daily_elasticity['date'] <= day)
-        ].copy()
-
-        if tst_window_elasticity.empty:
-            continue
-
-        # Generate features for the current window for the elasticity model
-        tst_window_elasticity_fe = feature_engineer_instance.transform_features(tst_window_elasticity, 'elasticity', is_for_training=False)
-        
-        # Filter to get only the rows for the current 'day' that need prediction
-        tst_to_predict_elasticity = tst_window_elasticity_fe.loc[
-            tst_window_elasticity_fe['date'] == day,
-            feature_engineer_instance.get_feature_names('elasticity')
-        ]
-
-        if tst_to_predict_elasticity.empty:
-            continue
-
-        # Predict daily sales using the elasticity model ensemble
-        predicted_daily_sales = elasticity_model_instance.predict_ensemble(tst_to_predict_elasticity)
-        
-        # Update the 'demand' column in the temporary DataFrame with the new prediction
-        # This is crucial for subsequent lag calculations within this specific monthly prediction
-        temp_df_for_daily_elasticity.loc[temp_df_for_daily_elasticity['date'] == day, 'demand'] = predicted_daily_sales
-
-        total_predicted_sales_for_month += predicted_daily_sales.sum() # Sum up for all items for that day
-
-    return total_predicted_sales_for_month

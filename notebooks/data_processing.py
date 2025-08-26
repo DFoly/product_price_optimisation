@@ -91,10 +91,11 @@ data_processor = DataProcessor(config, spark)
 df = data_processor.preprocess()
 
 table_name = f"{data_processor.config.catalog_name}.{data_processor.config.schema_name}.price_features"
+print(table_name)
 
 # COMMAND ----------
 
-print(df.count()), print(df_features.count())
+# %sql drop table dev.price_optimisation.price_features
 
 # COMMAND ----------
 
@@ -102,7 +103,11 @@ fe_instance = FeatureProducer(spark)
 df_features = fe_instance.generate_features_spark(df)
 
 fe_instance.publish_features(df_features, table_name)
-# display(df_features)
+display(df_features.limit(10))
+
+# COMMAND ----------
+
+print(df.count()), print(df_features.count())
 
 # COMMAND ----------
 
